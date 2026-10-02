@@ -4,6 +4,7 @@ Guardrails map to the OWASP Top 10 for LLM Applications (2025): LLM01 prompt inj
 information, LLM07 system-prompt leakage, LLM08 access control on retrieval, LLM09 misinformation (answer
 only from cited sources), LLM10 unbounded consumption (input caps).
 """
+import dataclasses
 import datetime
 import difflib
 import os
@@ -13,12 +14,12 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import style
+from . import critic, style
 from .agents import load_all
 from .arabic import detect_lang, franco_to_arabic, normalize, sentences, stem_ar, tokenize, words
 from .cache import AnswerCache
 from .llm import LLM, Grounded
-from .metrics import METRICS
+from .metrics import METRICS, usage_scope
 from .ocr import LOW_CONFIDENCE
 from .rag import BaseIndex, Chunk
 from .security import SecureLog, pseudonym, redact
@@ -75,7 +76,7 @@ ROUTES = {
     "auc-research-assistant": r"sources|articles|peer.?reviewed|\bapa\b|\bmla\b|chicago style|citation|cite"
                               r"|literature review|مصادر|مراجع|اعمل بحث|عمل بحث|ابدأ منين|ابدا منين|research on|research about"
                               r"|want to research|where (do|should) i (start|begin)",
-    "auc-catalog-navigator": r"do(es)? (you|the library) have|isbn|call number|(?<!my )\bthes[ie]s\b|dissertation"
+    "auc-catalog-navigator": r"do(es)? (you|the library) have|isbn|call number|(?<!my )\bthes[ie]s\b|dissertation|\bresala\b|\brasa2el\b"
                              r"|available|catalog|عندكم كتاب|في كتاب اسمه|رسال[ةه]|رسائل|ماجستير|دكتوراه",
 }
 
@@ -96,11 +97,17 @@ GLOSSARY = {
     "alumnus": "alumni", "alumna": "alumni", "graduates": "alumni", "undergrad": "undergraduate students",
     "undergrads": "undergraduate students", "postgrad": "graduate students", "checkout": "borrow",
     "keep": "borrow loan period", "extend": "renew", "renewal": "renew", "renewel": "renew",
-    "dissertations": "theses", "dissertation": "theses", "id": "passport government photo ID",
+    "published": "repository", "publish": "repository", "dissertations": "theses", "dissertation": "theses", "id": "passport government photo ID",
     "identification": "passport government photo ID", "outsiders": "external visitors",
     "outside": "external visitors", "strongest": "strengths", "strengths": "strengths",
     "professors": "faculty", "lecturers": "faculty", "staff": "faculty administrators",
     # Arabic / Franco-Arabic additions
+    "دكتوراه": "doctoral dissertation", "ماجستير": "master's thesis", "رسالة": "thesis", "رسائل": "theses",
+    "resala": "thesis", "rasa2el": "theses", "اقتصاد": "economics", "الاقتصاد": "economics",
+    "علم النفس": "psychology", "النفس": "psychology", "هندسة": "engineering", "العمارة": "architecture",
+    "عمارة": "architecture", "السياسة": "political science policy", "سياسة": "political science policy",
+    "الصحافة": "journalism", "الاعلام": "journalism mass communication", "المصريات": "egyptology",
+    "الحاسب": "computer science", "الحاسبات": "computer science", "الأجور": "wage", "الاجور": "wage",
     "الدور": "floor location entrance", "maw3ed": "hours", "mawa3ed": "hours", "a7gez": "book reserve",
     "ma3ad": "appointment consultation", "me3ad": "appointment consultation", "amin": "librarian",
     "كارنيه": "ID card", "الكارنيه": "ID card", "fat7a": "open hours", "fat7": "open hours",
@@ -139,6 +146,38 @@ def referral(question: str) -> dict | None:
         if any(re.search(rf"\b{re.escape(normalize(k))}", norm) for k in o.get("keywords", [])):
             return o
     return None
+
+
+_THESIS = re.compile(r"\b(thes[ie]s|dissertations?|capstones?|resala|rasa2el|rasayel)\b|رسال[ةه]|رسائل|ماجستير|دكتوراه",
+                     re.I)
+THESIS_TERMS = set(tokenize("thesis theses dissertation dissertations capstone resala rasa2el رسالة رسائل ماجستير دكتوراه"))
+_SINCE = re.compile(r"\b(?:since|after|from)\s+((?:19|20)\d\d)\b|(?:منذ|بعد|من)\s+((?:19|20)\d\d)")
+_UNTIL = re.compile(r"\b(?:before|until|to)\s+((?:19|20)\d\d)\b|(?:قبل|حتى|الى|إلى)\s+((?:19|20)\d\d)")
+_IN_YEAR = re.compile(r"\bin\s+((?:19|20)\d\d)\b|(?:في|سنة|عام)\s+((?:19|20)\d\d)")
+_ADVISOR = re.compile(r"\b(?:supervised|advised)\s+by\s+(?:dr\.?\s+|prof(?:essor)?\.?\s+)?([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)?)"
+                      r"|\badvisor\s+(?:dr\.?\s+)?([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)?)|(?:اشراف|إشراف)\s+(?:د\.?\s*)?(\S+(?:\s\S+)?)")
+
+
+def thesis_filters(question: str, departments: list[str]) -> dict:
+    """Metadata filters a thesis question asks for: type, year range, advisor, department."""
+    if not _THESIS.search(question):
+        return {}
+    f = {"type": "thesis"}
+    pick = lambda m: next(g for g in m.groups() if g)  # noqa: E731
+    if m := _SINCE.search(question):
+        f["year_from"] = pick(m)
+    if m := _UNTIL.search(question):
+        f["year_to"] = pick(m)
+    if (m := _IN_YEAR.search(question)) and "year_from" not in f:
+        f["year_from"] = f["year_to"] = pick(m)
+    if m := _ADVISOR.search(question):
+        f["advisor"] = pick(m)
+    low = normalize(question)
+    for d in sorted(departments, key=len, reverse=True):  # longest first: "political science" before "science"
+        if d and normalize(d) in low:
+            f["department"] = d
+            break
+    return f
 
 
 class Trace:
@@ -230,6 +269,7 @@ class Answer:
                 "related": self.related, "trace": self.trace,
                 "sources": [{"n": i, "title": c.title, "section": c.section, "url": link(c), "page": c.page,
                              "method": c.method, "confidence": c.confidence, "origin": c.origin,
+                             "updated": c.updated, "meta": c.meta,
                              "quotes": self.quotes.get(i, [])} for i, c in self.sources],
                 "retrieved": [{"score": round(s, 4), "title": c.title, "section": c.section, "method": c.method}
                               for s, c in self.hits]}
@@ -287,6 +327,11 @@ class LibraryChat:
         self.index, self.llm, self.k, self.access = index, llm, k, access
         self.catalog, self.cache = catalog, cache
         self.maintenance = os.getenv("AGENTKIT_MAINTENANCE") == "1"  # also toggled from the staff page
+        self.budget = None  # BudgetMonitor, attached by make_chat when AppDB is on
+        self.semcache = None
+        if os.getenv("AGENTKIT_SEMCACHE") == "1":
+            from .semcache import SemanticCache
+            self.semcache = SemanticCache()
         self.appdb, self.libcal, self.account = appdb, libcal, account
         self.log = SecureLog(log_path) if log_path else None
         self.agents = load_all()
@@ -321,11 +366,40 @@ class LibraryChat:
             n += 1
         return n
 
-    def _retrieve(self, query: str, expansions: list[str], access: tuple) -> list:
+    def _plugin(self, agent: str) -> str:
+        a = self.agents.get(agent)
+        return a.division if a else "chat"
+
+    def _optional_calls(self) -> bool:
+        """Grade/rewrite/critic model calls: live only, and paused by the budget soft brake."""
+        return self.llm.live and not getattr(self.llm, "brake", False)
+
+    def _meta_summary(self) -> tuple[bool, list[str]]:
+        """(any theses indexed, departments), recomputed only when the index changes."""
+        if getattr(self, "_meta_version", None) != self.index.version:
+            metas = [c.meta for c in self.index.iter_chunks() if c.meta]
+            self._meta_cache = (any(m.get("type") == "thesis" for m in metas),
+                                sorted({m.get("department", "") for m in metas} - {""}))
+            self._meta_version = self.index.version
+        return self._meta_cache
+
+    def _has_theses(self) -> bool:
+        return self._meta_summary()[0]
+
+    def _departments(self) -> list[str]:
+        return self._meta_summary()[1]
+
+    def _retrieve(self, query: str, expansions: list[str], access: tuple, filters: dict | None = None) -> list:
         """Hybrid search plus the relevance gate: a chunk must support enough of the question's concepts."""
         specific = set(tokenize(" ".join([query, *expansions]))) - GENERIC
         need = min(2, self._concepts(query))  # one weak/fuzzy term is not evidence of relevance
-        scored = [(s, c, support(specific, c.tokens)) for s, c in self.index.search(query, self.k, expansions, access)]
+        if filters:  # "thesis" is the filter, not evidence: only the topic words must match
+            specific -= THESIS_TERMS
+            need = min(2, self._concepts(_THESIS.sub(" ", query)))
+            if len(filters) > 1:  # department, year or advisor already narrowed the set
+                need = min(need, 1)
+        scored = [(s, c, support(specific, c.tokens))
+                  for s, c in self.index.search(query, self.k, expansions, access, filters=filters)]
         best = max((n for *_, n in scored), default=0)
         # keep chunks with at least half the best chunk's term support: less noise for the model
         return [(s, c) for s, c, n in scored if n >= max(need, (best + 1) // 2)]
@@ -343,7 +417,7 @@ class LibraryChat:
     def _rewrite(self, query: str, lang: str) -> str:
         """One retry with a better query. Live: a fast model rewrites it. Offline: spelling is corrected against
         the index vocabulary and Franco-Arabic is transliterated."""
-        if self.llm.live:
+        if self._optional_calls():
             out = self.llm.complete(REWRITE_PROMPT, redact(query), fast=True, max_tokens=60).strip()
             return out.splitlines()[0][:300] if out else query
         vocab = self.index.vocabulary()
@@ -357,7 +431,7 @@ class LibraryChat:
             fixed.append(near[0] if near else w)
         out = " ".join(fixed)
         if lang == "arabizi":
-            out += " " + franco_to_arabic(query)
+            out += " " + " ".join(franco_to_arabic(query))
         return out if out.strip() != query.lower().strip() else query
 
     def _system(self, agent: str, extra: str) -> str:
@@ -370,7 +444,9 @@ class LibraryChat:
     def _prepare(self, question: str, history: list[dict] | None, access: tuple):
         """Everything before generation. Returns ("final", Answer) or ("generate", context dict)."""
         trace = Trace()
-        kind, out = self._plan(question, history, access, trace)
+        agent = route(question)
+        with usage_scope(agent=agent, plugin=self._plugin(agent), purpose="answer"):
+            kind, out = self._plan(question, history, access, trace)
         if kind == "final":
             out.trace = out.trace or trace.steps
         else:
@@ -401,22 +477,28 @@ class LibraryChat:
         if hits:
             trace.step("catalog", t0, results=len(hits))
         attempts = int(os.getenv("AGENTKIT_MAX_RETRIEVAL_ATTEMPTS", "2"))
+        # no harvested theses yet: answer from the Knowledge Fountain page instead of filtering everything out
+        filters = thesis_filters(question, self._departments()) if self._has_theses() else {}
+        if filters:
+            trace.step("filters", t0, **{k: v for k, v in filters.items() if k != "type"})
         query = retrieval_q
         for attempt in range(1, attempts + 1):
             if hits:
                 break
             t1 = time.perf_counter()
-            hits = self._retrieve(query, expansions if attempt == 1 else self._expand(query, lang), access)
+            hits = self._retrieve(query, expansions if attempt == 1 else self._expand(query, lang), access, filters)
             trace.step("retrieve", t1, attempt=attempt, results=len(hits))
-            if hits and self.llm.live and os.getenv("AGENTKIT_GRADE", "1") == "1":
+            if hits and self._optional_calls() and os.getenv("AGENTKIT_GRADE", "1") == "1":
                 t1 = time.perf_counter()
-                kept = self._grade(redact(question), hits)
+                with usage_scope(purpose="grade"):
+                    kept = self._grade(redact(question), hits)
                 trace.step("grade", t1, kept=len(kept), dropped=len(hits) - len(kept))
                 METRICS.inc("agentkit_grade_dropped_total", len(hits) - len(kept))
                 hits = kept
             if not hits and attempt < attempts:
                 t1 = time.perf_counter()
-                rewritten = self._rewrite(query, lang)
+                with usage_scope(purpose="rewrite"):
+                    rewritten = self._rewrite(query, lang)
                 trace.step("rewrite", t1, changed=rewritten != query)
                 if rewritten == query:
                     break
@@ -454,6 +536,36 @@ class LibraryChat:
                             "live": bool(live), "question": question, "notes": notes,
                             "t_generate": time.perf_counter()}
 
+    def _critic(self, ctx: dict, g: Grounded) -> Grounded:
+        """Check research and policy answers before they are shown: mechanical checks, then (live) a fast-model
+        review; one revision; otherwise the answer becomes a handoff (ctx["critic"] == "handoff")."""
+        hits = ctx["hits"]
+        g.text = style.clean(g.text)  # filler is removed deterministically; judge what the reader will see
+        cited = [(n, hits[n - 1][1]) for n in g.cited if 1 <= n <= len(hits)]
+        if os.getenv("AGENTKIT_CRITIC", "1") != "1" or not cited or not critic.in_scope(ctx["agent"], g.text, len(cited)):
+            return g
+        t0, trace = time.perf_counter(), ctx.setdefault("trace", Trace())
+        issues, verdict = critic.check(g.text, g.quotes, cited), "pass"
+        if not issues and self._optional_calls():
+            with usage_scope(agent=ctx["agent"], plugin=self._plugin(ctx["agent"]), purpose="critic"):
+                r = critic.review(self.llm, redact(ctx.get("question", "")), g.text, cited)
+            if r["verdict"] == "fix":
+                issues = r.get("issues") or [r.get("fix") or "low review score"]
+        if issues:
+            verdict = "handoff"
+            if self._optional_calls():
+                note = "\n- A reviewer found problems in your draft: " + "; ".join(issues[:5]) + \
+                       ". Rewrite the answer using only the search results, quoting them exactly."
+                with usage_scope(agent=ctx["agent"], plugin=self._plugin(ctx["agent"]), purpose="critic"):
+                    g2 = self.llm.answer(ctx["system"] + note, ctx["asked"], _sources(hits))
+                cited2 = [(n, hits[n - 1][1]) for n in g2.cited if 1 <= n <= len(hits)]
+                if cited2 and not critic.check(g2.text, g2.quotes, cited2):
+                    g, verdict = g2, "revised"
+        METRICS.inc("agentkit_critic_total", verdict=verdict)
+        trace.step("critic", t0, critic=verdict, issues=len(issues))
+        ctx["critic"] = verdict
+        return g
+
     def _finish(self, ctx: dict, grounded: Grounded) -> Answer:
         hits = ctx["hits"]
         trace = ctx.get("trace") or Trace()
@@ -465,6 +577,11 @@ class LibraryChat:
         if any(c.method.startswith("ocr") and c.confidence < LOW_CONFIDENCE for _, c in cited):
             ans.notes.append("Part of this answer comes from a scanned page that staff have not checked yet; "
                              "please confirm it against the scan.")
+            trace.step("unchecked_scan", time.perf_counter())
+        if ctx.get("critic") == "handoff":  # unconfirmed against the sources: never shown as an answer
+            ans.mode = "handoff"
+            ans.text = ("I couldn't confirm an answer against the library sources, so a librarian should help with "
+                        "this. These pages may be useful: " + "; ".join(f"[{n}] {c.title}" for n, c in cited) + ".")
         if ans.notes:
             ans.text += "\n\n" + " ".join(ans.notes)
         ans.trace = trace.steps
@@ -541,6 +658,21 @@ class LibraryChat:
             return None
         return self.cache.key(question, self.index.version, access)
 
+    def _semantic(self, question: str, history, access: tuple):
+        """(cached answer or None, signature). Only plain questions; never refusals, accounts or follow-ups."""
+        if self.semcache is None or history or self.maintenance or guard(question) or ACCOUNT_RE.search(question):
+            return None, None
+        from .semcache import signature
+        t0 = time.perf_counter()
+        sig = signature(question, detect_lang(question), route(question), self.index.version, access)
+        hit, sim, cost = self.semcache.get(question, sig)
+        if hit is None:
+            return None, sig
+        METRICS.inc("agentkit_semantic_cache_hits_total")
+        METRICS.inc("agentkit_cache_saved_usd_total", cost)
+        step = {"step": "semantic_cache", "ms": round((time.perf_counter() - t0) * 1000, 2), "similarity": round(sim, 3)}
+        return dataclasses.replace(hit, id=uuid.uuid4().hex[:12], trace=[step]), sig
+
     def ask(self, question: str, history: list[dict] | None = None, access: tuple | None = None,
             user: str = "") -> Answer:
         question, access = question.strip(), tuple(access or self.access)
@@ -550,18 +682,27 @@ class LibraryChat:
         if cached is not None:
             METRICS.inc("agentkit_cache_hits_total")
             return self._record(question, cached, t0, user, cached=True)
+        sem_hit, sem_sig = self._semantic(question, history, access)
+        if sem_hit is not None:
+            return self._record(question, sem_hit, t0, user, cached=True)
+        cost0 = METRICS.value("agentkit_llm_cost_usd_total")
         self._user = user
         kind, payload = self._prepare(question, history, access)
         live = kind == "generate" and payload.get("live")
         if kind == "generate":
             t1 = time.perf_counter()
-            payload = self._finish(payload, self.llm.answer(payload["system"], payload["asked"],
-                                                            _sources(payload["hits"])))
+            with usage_scope(agent=payload["agent"], plugin=self._plugin(payload["agent"]), purpose="answer"):
+                grounded = self.llm.answer(payload["system"], payload["asked"], _sources(payload["hits"]))
+            payload = self._finish(payload, self._critic(payload, grounded))
             METRICS.observe("agentkit_stage_seconds", time.perf_counter() - t1, stage="generate")
         elif payload.mode in ("handoff", "strategy"):
             payload = self._with_actions(payload, question)
         if key and not live and payload.mode in ("answer", "handoff", "refuse"):
             self.cache.put(key, payload)
+        if sem_sig:
+            from .semcache import cacheable
+            if cacheable(payload):
+                self.semcache.put(question, sem_sig, payload, METRICS.value("agentkit_llm_cost_usd_total") - cost0)
         return self._record(question, payload, t0, user)
 
     def ask_stream(self, question: str, history: list[dict] | None = None, access: tuple | None = None,
@@ -576,6 +717,11 @@ class LibraryChat:
             yield "delta", cached.text
             yield "done", self._record(question, cached, t0, user, cached=True)
             return
+        sem_hit, _ = self._semantic(question, history, access)
+        if sem_hit is not None:
+            yield "delta", sem_hit.text
+            yield "done", self._record(question, sem_hit, t0, user, cached=True)
+            return
         self._user = user
         kind, payload = self._prepare(question, history, access)
         if kind == "final":
@@ -584,11 +730,28 @@ class LibraryChat:
             yield "delta", payload.text
             yield "done", self._record(question, payload, t0, user)
             return
-        for event, data in self.llm.stream_answer(payload["system"], payload["asked"], _sources(payload["hits"])):
+        if payload["agent"] in critic.HOLD_AGENTS:  # research answers are checked before any text is shown
+            yield "status", "checking"
+            with usage_scope(agent=payload["agent"], plugin=self._plugin(payload["agent"]), purpose="answer"):
+                grounded = self.llm.answer(payload["system"], payload["asked"], _sources(payload["hits"]))
+            ans = self._finish(payload, self._critic(payload, grounded))
+            if key and not payload.get("live"):
+                self.cache.put(key, ans)
+            yield "delta", ans.text
+            yield "done", self._record(question, ans, t0, user)
+            return
+        stream = self.llm.stream_answer(payload["system"], payload["asked"], _sources(payload["hits"]))
+        labels = {"agent": payload["agent"], "plugin": self._plugin(payload["agent"]), "purpose": "answer"}
+        while True:
+            with usage_scope(**labels):  # set and reset around each step: never across a yield
+                step = next(stream, None)
+            if step is None:
+                break
+            event, data = step
             if event == "delta":
                 yield "delta", data
             else:
-                ans = self._finish(payload, data)
+                ans = self._finish(payload, self._critic(payload, data))  # a failed check replaces the streamed text
                 if key and not payload.get("live"):
                     self.cache.put(key, ans)
                 yield "done", self._record(question, ans, t0, user)
@@ -597,6 +760,11 @@ class LibraryChat:
         METRICS.inc("agentkit_requests_total", mode=ans.mode)
         if self.appdb and ans.mode in ("handoff", "strategy") and not cached:
             self.appdb.add_unanswered(question, ans.mode, ans.lang, ans.agent, user)
+        if self.appdb and ans.mode != "account":  # dashboard data; account answers hold personal data
+            try:
+                self.appdb.add_answer(question, ans.to_dict(), user, cached, (time.perf_counter() - t0) * 1000)
+            except Exception:  # noqa: BLE001 — analytics never breaks an answer
+                pass
         METRICS.observe("agentkit_stage_seconds", time.perf_counter() - t0, stage="total")
         if self.log and ans.mode != "account":  # account answers contain personal data: never logged
             self.log.write({"ts": int(time.time()), "user": pseudonym(user), "q": redact(question),
